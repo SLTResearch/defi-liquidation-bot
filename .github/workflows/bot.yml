@@ -1,0 +1,63 @@
+# ── LiqBot — GitHub Actions ───────────────────────────────────────
+# Tourne toutes les 15 minutes, 24h/24, 7j/7
+# Utilise les GitHub Secrets — aucun secret dans le code
+# ─────────────────────────────────────────────────────────────────
+
+name: LiqBot Simulation
+
+on:
+  schedule:
+    # Toutes les 15 minutes (minimum GitHub Actions)
+    - cron: '*/15 * * * *'
+
+  # Permet de lancer manuellement depuis l'onglet Actions
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    name: Scan Aave positions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # sécurité — tue le job si bloqué
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'  # cache les dépendances → démarrage rapide
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: Run LiqBot
+        timeout-minutes: 8
+        env:
+          # Injection automatique des GitHub Secrets
+          ALCHEMY_RPC_URL:   ${{ secrets.ALCHEMY_RPC_URL }}
+          PRIVATE_KEY:       ${{ secrets.PRIVATE_KEY }}
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN:           ${{ secrets.DRY_RUN }}
+          MIN_PROFIT_EUR:    "0.50"
+        run: |
+          python3 monitor.py &
+          BOT_PID=$!
+
+          # Laisse tourner 7 minutes puis arrête proprement
+          sleep 420
+          kill $BOT_PID 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()  # upload même si erreur
+        uses: actions/upload-artifact@v4
+        with:
+          name: liqbot-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 7
