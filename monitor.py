@@ -1,24 +1,22 @@
-# ── monitor.py v3 ─────────────────────────────────────────────────
-# Logique de surveillance :
+# ── monitor.py v4 ─────────────────────────────────────────────────
+# Architecture : zéro dépendance externe
 #
-# Subgraph (toutes les 5 min)
-#   → enrichit la watchlist persistée dans JSONBin
-#   → survit aux restarts GitHub Actions
+# Sources de données :
+#   1. Events Borrow on-chain (Alchemy RPC) → alimente la watchlist
+#   2. Watchlist persistée JSONBin → survit aux restarts
+#   3. Scan RPC direct toutes les 12s → détection < 12s
 #
-# Watchlist RPC (toutes les 12s — chaque bloc)
-#   → surveille directement chaque adresse connue
-#   → délai < 12 secondes, pas de dépendance subgraph
-#   → retire les adresses saines (HF > 1.3)
+# Zéro subgraph, zéro API tierce pour les données de marché
 # ─────────────────────────────────────────────────────────────────
 
-import os, time, json, logging, requests
+import os, time, json, logging
 from web3 import Web3
 from dotenv import load_dotenv
 from calculator import is_profitable
 from notifier import send_alert
 from logger import (
     load_watchlist, save_watchlist, remove_from_watchlist,
-    log_opportunity, log_liquidation, log_scan
+    log_opportunity, log_scan
 )
 
 load_dotenv()
@@ -27,17 +25,19 @@ load_dotenv()
 
 RPC_URL          = os.getenv("ALCHEMY_RPC_URL")
 DRY_RUN          = os.getenv("DRY_RUN", "True") == "True"
-POLL_SEC         = 12    # 1 bloc Arbitrum
-SUBGRAPH_REFRESH = 300   # refresh subgraph toutes les 5 minutes
-HF_WATCH_MAX     = 1.1   # ajouter à watchlist si HF < 1.1
-HF_REMOVE        = 1.3   # retirer de watchlist si HF > 1.3 (position saine)
+POLL_SEC         = 12      # 1 bloc Arbitrum
+ONCHAIN_REFRESH  = 300     # refresh events on-chain toutes les 5 min
+BLOCKS_LOOKBACK  = 50_000  # ~7 jours sur Arbitrum
+HF_WATCH_MAX     = 1.1    # ajouter à watchlist si HF < 1.1
+HF_REMOVE        = 1.3    # retirer de watchlist si HF > 1.3
 
+# Contrat Aave v3 Arbitrum One
 AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
 
-SUBGRAPH_URLS = [
-    "https://gateway.thegraph.com/api/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF",
-    "https://api.thegraph.com/subgraphs/name/aave/protocol-v3-arbitrum",
-]
+# Topic keccak256 de l'event Borrow — identifie les emprunteurs actifs
+# Borrow(address asset, address user, address onBehalfOf, uint256 amount,
+#        uint8 interestRateMode, uint256 borrowRate, uint16 referralCode)
+BORROW_TOPIC = "0xb3d084820fb1a9decffb176436bd02b9d7285aea2f6e9fbef932c07c70af5805"
 
 POOL_ABI = json.loads('''[{
   "name": "getUserAccountData",
@@ -73,80 +73,79 @@ pool = w3.eth.contract(
 )
 
 if not w3.is_connected():
-    log.error("❌ Connexion RPC échouée")
+    log.error("❌ Connexion RPC échouée — vérifie ALCHEMY_RPC_URL")
     raise SystemExit(1)
 
-log.info(f"✅ Connecté — bloc #{w3.eth.block_number}")
+log.info(f"✅ Connecté à Arbitrum — bloc #{w3.eth.block_number}")
 
-# ── Subgraph ──────────────────────────────────────────────────────
 
-SUBGRAPH_QUERY = """
-{
-  users(
-    first: 200
-    where: { healthFactor_lt: "1100000000000000000" }
-    orderBy: healthFactor
-    orderDirection: asc
-  ) { id }
-}
-"""
+# ── Source : Events on-chain ──────────────────────────────────────
 
-def refresh_from_subgraph(watchlist: list) -> list:
+def fetch_borrowers_onchain(watchlist: list) -> list:
     """
-    Interroge le subgraph et enrichit la watchlist.
-    Appelé toutes les 5 minutes — pas à chaque bloc.
-    Retourne la watchlist mise à jour.
+    Récupère les emprunteurs actifs via Dune Analytics.
+    Query 7431829 — Aave v3 Arbitrum borrowers 7 derniers jours.
     """
-    for url in SUBGRAPH_URLS:
-        try:
-            r = requests.post(
-                url, json={"query": SUBGRAPH_QUERY}, timeout=15
-            )
-            users = r.json().get("data", {}).get("users", [])
-            if users:
-                new_addrs = [u["id"] for u in users]
-                # Merge sans doublons
-                existing = set(watchlist)
-                added = [a for a in new_addrs if a not in existing]
-                watchlist = list(existing | set(new_addrs))
-                log.info(
-                    f"📡 Subgraph refresh: {len(new_addrs)} trouvées, "
-                    f"+{len(added)} nouvelles → watchlist={len(watchlist)}"
-                )
-                save_watchlist(watchlist)
-                return watchlist
-        except Exception as e:
-            log.warning(f"Subgraph failed ({url[:35]}…): {e}")
+    import requests
 
-    log.warning("⚠️  Subgraph indisponible — watchlist inchangée")
-    return watchlist
+    try:
+        r = requests.get(
+            "https://api.dune.com/api/v1/query/7431829/results",
+            headers={"X-Dune-API-Key": os.getenv("DUNE_API_KEY")},
+            params={"limit": 500},
+            timeout=30
+        )
+
+        if r.status_code != 200:
+            log.warning(f"Dune API error {r.status_code}: {r.text[:100]}")
+            return watchlist
+
+        rows = r.json().get("result", {}).get("rows", [])
+        borrowers = [row["user_address"] for row in rows if row.get("user_address")]
+
+        existing  = set(watchlist)
+        new_addrs = [b for b in borrowers if b not in existing]
+        merged    = list(existing | set(borrowers))
+
+        log.info(
+            f"⛓️  Dune: {len(borrowers)} emprunteurs | "
+            f"+{len(new_addrs)} nouveaux | "
+            f"watchlist={len(merged)}"
+        )
+
+        save_watchlist(merged)
+        return merged
+
+    except Exception as e:
+        log.warning(f"❌ Dune API error: {e}")
+        return watchlist
 
 
-# ── Lecture RPC directe ───────────────────────────────────────────
+# ── Scan RPC direct ───────────────────────────────────────────────
 
 def get_account_data(address: str) -> dict | None:
+    """Interroge getUserAccountData() directement via RPC."""
     try:
         d = pool.functions.getUserAccountData(
             Web3.to_checksum_address(address)
         ).call()
+        hf = d[5] / 1e18
         return {
             "address":        address,
-            "health_factor":  d[5] / 1e18,
+            "health_factor":  hf,
             "debt_usd":       d[1] / 1e8,
             "collateral_usd": d[0] / 1e8,
-            "liquidatable":   (d[5] / 1e18) < 1.0
+            "liquidatable":   hf < 1.0
         }
-    except Exception as e:
-        log.warning(f"RPC error ({address[:8]}…): {e}")
+    except:
         return None
 
 
 def scan_watchlist(watchlist: list) -> list:
     """
-    Scanne toutes les adresses de la watchlist via RPC direct.
+    Scanne chaque adresse de la watchlist via RPC direct.
     - Retire les positions saines (HF > 1.3)
-    - Traite les positions liquidables
-    Retourne la watchlist nettoyée.
+    - Traite les positions liquidables immédiatement
     """
     to_remove = []
 
@@ -158,48 +157,54 @@ def scan_watchlist(watchlist: list) -> list:
         hf   = data["health_factor"]
         debt = data["debt_usd"]
 
-        # Position redevenue saine → retirer de la watchlist
-        if hf > HF_REMOVE:
+        # Position redevenue saine → retirer
+        if hf > HF_REMOVE or debt < 1.0:
             to_remove.append(address)
             continue
 
-        # Log si proche du seuil
-        if hf < 1.05:
-            log.warning(f"🔴 HF={hf:.4f} | dette={debt:.2f}$ | {address[:10]}…")
-        elif hf < HF_WATCH_MAX:
-            log.info(f"🟡 HF={hf:.4f} | dette={debt:.2f}$ | {address[:10]}…")
-
-        # Position liquidable
-        if data["liquidatable"]:
+        # Log selon le niveau de danger
+        if hf < 1.0:
+            log.warning(f"🔴 LIQUIDABLE | HF={hf:.4f} | dette={debt:.2f}$")
             process_liquidatable(address, hf, debt)
+        elif hf < 1.05:
+            log.warning(f"🟠 DANGER     | HF={hf:.4f} | dette={debt:.2f}$ | {address[:10]}…")
+        elif hf < HF_WATCH_MAX:
+            log.info(f"🟡 VIGILANCE  | HF={hf:.4f} | dette={debt:.2f}$ | {address[:10]}…")
 
-        time.sleep(0.1)  # rate limit Alchemy
+        time.sleep(0.05)  # évite le rate limit Alchemy
 
-    # Nettoyage des positions saines
+    # Nettoyage watchlist
     for addr in to_remove:
         watchlist.remove(addr)
         remove_from_watchlist(addr)
-        log.info(f"✅ Retiré watchlist (HF sain): {addr[:10]}…")
+
+    if to_remove:
+        log.info(f"🗑️  {len(to_remove)} positions saines retirées")
 
     return watchlist
 
 
-def process_liquidatable(address: str, hf: float, debt: float):
-    """Calcule et déclenche si rentable."""
-    log.warning(f"🎯 LIQUIDABLE | HF={hf:.4f} | dette={debt:.2f}$")
+# ── Traitement liquidation ────────────────────────────────────────
 
+def process_liquidatable(address: str, hf: float, debt: float):
+    """Calcule la rentabilité et exécute si profitable."""
     profitable, net_profit = is_profitable(
-        debt_usd=debt, bonus_pct=5.0, w3=w3
+        debt_usd=debt,
+        bonus_pct=5.0,
+        w3=w3
     )
 
     log_opportunity(
-        address=address, hf=hf, debt_usd=debt,
-        net_profit=net_profit, dry_run=DRY_RUN
+        address=address,
+        hf=hf,
+        debt_usd=debt,
+        net_profit=net_profit,
+        dry_run=DRY_RUN
     )
 
     if profitable:
         send_alert(
-            f"⚡ LIQUIDATION DÉTECTÉE\n"
+            f"⚡ <b>LIQUIDATION DÉTECTÉE</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"Health    : {hf:.4f}\n"
             f"Dette     : {debt:.2f} USDC\n"
@@ -216,32 +221,31 @@ def process_liquidatable(address: str, hf: float, debt: float):
 # ── Boucle principale ─────────────────────────────────────────────
 
 def main():
-    log.info(f"🤖 LiqBot v3 — DRY_RUN={DRY_RUN}")
+    log.info(f"🤖 LiqBot v4 — DRY_RUN={DRY_RUN}")
 
-    # Charge la watchlist persistée depuis JSONBin au démarrage
+    # Charge la watchlist persistée depuis JSONBin
     watchlist = load_watchlist()
 
     send_alert(
-        f"🤖 LiqBot v3 démarré\n"
+        f"🤖 <b>LiqBot v4 démarré</b>\n"
         f"Mode     : {'SIMULATION' if DRY_RUN else 'LIVE'}\n"
-        f"Watchlist: {len(watchlist)} adresses chargées\n"
-        f"Réseau   : Arbitrum One"
+        f"Watchlist: {len(watchlist)} adresses\n"
+        f"Source   : 100% on-chain Alchemy"
     )
 
-    last_subgraph_refresh = 0
-    consecutive_errors    = 0
-    scan_count            = 0
+    last_onchain_refresh = 0
+    consecutive_errors   = 0
+    scan_count           = 0
 
     while True:
         try:
             now_ts = time.time()
             block  = w3.eth.block_number
 
-            # Refresh subgraph toutes les 5 minutes
-            if now_ts - last_subgraph_refresh > SUBGRAPH_REFRESH:
-                log.info("🔄 Refresh subgraph…")
-                watchlist = refresh_from_subgraph(watchlist)
-                last_subgraph_refresh = now_ts
+            # Refresh on-chain toutes les 5 minutes
+            if now_ts - last_onchain_refresh > ONCHAIN_REFRESH:
+                watchlist = fetch_borrowers_onchain(watchlist)
+                last_onchain_refresh = now_ts
 
             # Scan RPC direct sur toute la watchlist
             log.info(
@@ -249,7 +253,7 @@ def main():
             )
             watchlist = scan_watchlist(watchlist)
 
-            # Update stats JSONBin toutes les 10 itérations
+            # Update JSONBin toutes les 10 itérations
             scan_count += 1
             if scan_count % 10 == 0:
                 log_scan(block, len(watchlist))

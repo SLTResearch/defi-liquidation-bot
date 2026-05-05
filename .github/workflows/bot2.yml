@@ -34,6 +34,9 @@ jobs:
           PRIVATE_KEY:       ${{ secrets.PRIVATE_KEY }}
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          DUNE_API_KEY:      ${{ secrets.DUNE_API_KEY }}
+          JSONBIN_BIN_ID:    ${{ secrets.JSONBIN_BIN_ID }}
+          JSONBIN_API_KEY:   ${{ secrets.JSONBIN_API_KEY }}
           DRY_RUN:           ${{ secrets.DRY_RUN }}
           MIN_PROFIT_EUR:    "0.50"
         run: |
