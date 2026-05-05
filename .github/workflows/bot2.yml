@@ -1,0 +1,51 @@
+name: LiqBot Simulation 2
+
+on:
+  schedule:
+    - cron: '8,23,38,53 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    name: Scan Aave positions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: Run LiqBot
+        timeout-minutes: 8
+        env:
+          ALCHEMY_RPC_URL:   ${{ secrets.ALCHEMY_RPC_URL }}
+          PRIVATE_KEY:       ${{ secrets.PRIVATE_KEY }}
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN:           ${{ secrets.DRY_RUN }}
+          MIN_PROFIT_EUR:    "0.50"
+        run: |
+          python3 monitor.py &
+          BOT_PID=$!
+          sleep 420
+          kill $BOT_PID 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: liqbot2-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 7
