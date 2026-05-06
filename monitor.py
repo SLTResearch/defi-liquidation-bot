@@ -1,43 +1,38 @@
-# ── monitor.py v4 ─────────────────────────────────────────────────
-# Architecture : zéro dépendance externe
+# ── monitor.py v5 ─────────────────────────────────────────────────
+# Architecture simplifiée :
 #
-# Sources de données :
-#   1. Events Borrow on-chain (Alchemy RPC) → alimente la watchlist
-#   2. Watchlist persistée JSONBin → survit aux restarts
-#   3. Scan RPC direct toutes les 12s → détection < 12s
+#   Démarrage → Dune charge les emprunteurs actifs (1000 adresses)
+#   Boucle    → scan RPC direct toutes les 12s sur la watchlist
+#   Refresh   → Dune recharge toutes les 5 min (nouvelles positions)
+#   JSONBin   → uniquement pour les events et stats du dashboard
 #
-# Zéro subgraph, zéro API tierce pour les données de marché
+# Zéro persistence watchlist = zéro complexité = zéro bug
 # ─────────────────────────────────────────────────────────────────
 
-import os, time, json, logging
+import os, time, json, logging, requests
 from web3 import Web3
 from dotenv import load_dotenv
 from calculator import is_profitable
 from notifier import send_alert
-from logger import (
-    load_watchlist, save_watchlist, remove_from_watchlist,
-    log_opportunity, log_scan
-)
+from logger import log_opportunity, log_scan
 
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────
 
-RPC_URL          = os.getenv("ALCHEMY_RPC_URL")
-DRY_RUN          = os.getenv("DRY_RUN", "True") == "True"
-POLL_SEC         = 12      # 1 bloc Arbitrum
-ONCHAIN_REFRESH  = 300     # refresh events on-chain toutes les 5 min
-BLOCKS_LOOKBACK  = 50_000  # ~7 jours sur Arbitrum
-HF_WATCH_MAX     = 1.1    # ajouter à watchlist si HF < 1.1
-HF_REMOVE        = 1.3    # retirer de watchlist si HF > 1.3
+RPC_URL         = os.getenv("ALCHEMY_RPC_URL")
+DRY_RUN         = os.getenv("DRY_RUN", "True") == "True"
+DUNE_API_KEY    = os.getenv("DUNE_API_KEY")
+DUNE_QUERY_ID   = "7431829"
+POLL_SEC        = 12     # 1 bloc Arbitrum
+DUNE_REFRESH    = 300    # refresh Dune toutes les 5 min
+HF_DANGER       = 1.05   # log orange
+HF_WATCH        = 1.1    # log jaune
+HF_REMOVE       = 1.5    # retirer de la watchlist
+MAX_DEBT        = 5000   # notre niche — petites positions
+MIN_DEBT        = 100    # pas de micro-positions
 
-# Contrat Aave v3 Arbitrum One
 AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
-
-# Topic keccak256 de l'event Borrow — identifie les emprunteurs actifs
-# Borrow(address asset, address user, address onBehalfOf, uint256 amount,
-#        uint8 interestRateMode, uint256 borrowRate, uint16 referralCode)
-BORROW_TOPIC = "0xb3d084820fb1a9decffb176436bd02b9d7285aea2f6e9fbef932c07c70af5805"
 
 POOL_ABI = json.loads('''[{
   "name": "getUserAccountData",
@@ -73,81 +68,78 @@ pool = w3.eth.contract(
 )
 
 if not w3.is_connected():
-    log.error("❌ Connexion RPC échouée — vérifie ALCHEMY_RPC_URL")
+    log.error("❌ Connexion RPC échouée")
     raise SystemExit(1)
 
 log.info(f"✅ Connecté à Arbitrum — bloc #{w3.eth.block_number}")
 
 
-# ── Source : Events on-chain ──────────────────────────────────────
+# ── Dune : charge les emprunteurs actifs ──────────────────────────
 
-def fetch_borrowers_onchain(watchlist: list) -> list:
+def load_from_dune() -> list:
     """
-    Récupère les emprunteurs actifs via Dune Analytics.
-    Query 7431829 — Aave v3 Arbitrum borrowers 7 derniers jours.
+    Charge les emprunteurs actifs depuis Dune.
+    Retourne une liste d'adresses prête à être scannée.
+    Simple, direct, fiable.
     """
-    import requests
-
     try:
         r = requests.get(
-            "https://api.dune.com/api/v1/query/7431829/results",
-            headers={"X-Dune-API-Key": os.getenv("DUNE_API_KEY")},
-            params={"limit": 500},
+            f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/results",
+            headers={"X-Dune-API-Key": DUNE_API_KEY},
+            params={"limit": 1000},
             timeout=30
         )
-
         if r.status_code != 200:
-            log.warning(f"Dune API error {r.status_code}: {r.text[:100]}")
-            return watchlist
+            log.warning(f"Dune {r.status_code}: {r.text[:80]}")
+            return []
 
         rows = r.json().get("result", {}).get("rows", [])
-        borrowers = [row["user_address"] for row in rows if row.get("user_address")]
-
-        existing  = set(watchlist)
-        new_addrs = [b for b in borrowers if b not in existing]
-        merged    = list(existing | set(borrowers))
-
-        log.info(
-            f"⛓️  Dune: {len(borrowers)} emprunteurs | "
-            f"+{len(new_addrs)} nouveaux | "
-            f"watchlist={len(merged)}"
-        )
-
-        save_watchlist(merged)
-        return merged
+        addrs = [
+            row["user_address"]
+            for row in rows
+            if row.get("user_address")
+        ]
+        log.info(f"📡 Dune: {len(addrs)} emprunteurs chargés")
+        return addrs
 
     except Exception as e:
-        log.warning(f"❌ Dune API error: {e}")
-        return watchlist
+        log.warning(f"❌ Dune error: {e}")
+        return []
 
 
-# ── Scan RPC direct ───────────────────────────────────────────────
+# ── RPC : lecture directe du contrat ─────────────────────────────
 
 def get_account_data(address: str) -> dict | None:
-    """Interroge getUserAccountData() directement via RPC."""
+    """getUserAccountData() directement via Alchemy RPC."""
     try:
         d = pool.functions.getUserAccountData(
             Web3.to_checksum_address(address)
         ).call()
-        hf = d[5] / 1e18
+        hf   = d[5] / 1e18
+        debt = d[1] / 1e8
         return {
             "address":        address,
             "health_factor":  hf,
-            "debt_usd":       d[1] / 1e8,
+            "debt_usd":       debt,
             "collateral_usd": d[0] / 1e8,
-            "liquidatable":   hf < 1.0
+            "liquidatable":   hf < 1.0 and MIN_DEBT < debt < MAX_DEBT
         }
     except:
         return None
 
 
+# ── Scan de la watchlist ──────────────────────────────────────────
+
 def scan_watchlist(watchlist: list) -> list:
     """
-    Scanne chaque adresse de la watchlist via RPC direct.
-    - Retire les positions saines (HF > 1.3)
-    - Traite les positions liquidables immédiatement
+    Scanne toutes les adresses via RPC direct.
+    Retire les positions saines ou hors niche.
+    Traite immédiatement les positions liquidables.
     """
-    to_remove = []
+    to_remove  = []
+    vigilance  = 0
+    danger     = 0
+    liquidable = 0
 
     for address in watchlist:
         data = get_account_data(address)
@@ -157,29 +149,40 @@ def scan_watchlist(watchlist: list) -> list:
         hf   = data["health_factor"]
         debt = data["debt_usd"]
 
-        # Position redevenue saine → retirer
-        if hf > HF_REMOVE or debt < 1.0:
+        # Hors niche ou position saine → retirer
+        if hf > HF_REMOVE or debt < MIN_DEBT or debt > MAX_DEBT:
             to_remove.append(address)
             continue
 
-        # Log selon le niveau de danger
-        if hf < 1.0:
-            log.warning(f"🔴 LIQUIDABLE | HF={hf:.4f} | dette={debt:.2f}$")
+        # Classement par niveau de danger
+        if data["liquidatable"]:
+            liquidable += 1
             process_liquidatable(address, hf, debt)
-        elif hf < 1.05:
-            log.warning(f"🟠 DANGER     | HF={hf:.4f} | dette={debt:.2f}$ | {address[:10]}…")
-        elif hf < HF_WATCH_MAX:
-            log.info(f"🟡 VIGILANCE  | HF={hf:.4f} | dette={debt:.2f}$ | {address[:10]}…")
+        elif hf < HF_DANGER:
+            danger += 1
+            log.warning(
+                f"🟠 DANGER    | HF={hf:.4f} | "
+                f"dette={debt:.0f}$ | {address[:10]}…"
+            )
+        elif hf < HF_WATCH:
+            vigilance += 1
+            log.info(
+                f"🟡 VIGILANCE | HF={hf:.4f} | "
+                f"dette={debt:.0f}$ | {address[:10]}…"
+            )
 
-        time.sleep(0.05)  # évite le rate limit Alchemy
+        time.sleep(0.05)
 
-    # Nettoyage watchlist
+    # Nettoyage
     for addr in to_remove:
         watchlist.remove(addr)
-        remove_from_watchlist(addr)
 
-    if to_remove:
-        log.info(f"🗑️  {len(to_remove)} positions saines retirées")
+    if vigilance or danger or liquidable:
+        log.info(
+            f"📊 Scan | 🔴 {liquidable} liquidable(s) | "
+            f"🟠 {danger} danger | 🟡 {vigilance} vigilance | "
+            f"🗑️  {len(to_remove)} retirés"
+        )
 
     return watchlist
 
@@ -187,19 +190,16 @@ def scan_watchlist(watchlist: list) -> list:
 # ── Traitement liquidation ────────────────────────────────────────
 
 def process_liquidatable(address: str, hf: float, debt: float):
-    """Calcule la rentabilité et exécute si profitable."""
+    """Calcule la rentabilité et alerte si profitable."""
+    log.warning(f"🔴 LIQUIDABLE | HF={hf:.4f} | dette={debt:.0f}$")
+
     profitable, net_profit = is_profitable(
-        debt_usd=debt,
-        bonus_pct=5.0,
-        w3=w3
+        debt_usd=debt, bonus_pct=5.0, w3=w3
     )
 
     log_opportunity(
-        address=address,
-        hf=hf,
-        debt_usd=debt,
-        net_profit=net_profit,
-        dry_run=DRY_RUN
+        address=address, hf=hf, debt_usd=debt,
+        net_profit=net_profit, dry_run=DRY_RUN
     )
 
     if profitable:
@@ -207,7 +207,7 @@ def process_liquidatable(address: str, hf: float, debt: float):
             f"⚡ <b>LIQUIDATION DÉTECTÉE</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"Health    : {hf:.4f}\n"
-            f"Dette     : {debt:.2f} USDC\n"
+            f"Dette     : {debt:.0f} USDC\n"
             f"Profit net: +€{net_profit:.2f}\n"
             f"Mode      : {'🔵 SIMULATION' if DRY_RUN else '🟢 LIVE'}"
         )
@@ -215,45 +215,45 @@ def process_liquidatable(address: str, hf: float, debt: float):
             from executor import execute_liquidation
             execute_liquidation(address, debt)
     else:
-        log.info(f"⏭️  Skip — net={net_profit:.3f}€ insuffisant")
+        log.info(f"⏭️  Skip — net={net_profit:.3f}€")
 
 
 # ── Boucle principale ─────────────────────────────────────────────
 
 def main():
-    log.info(f"🤖 LiqBot v4 — DRY_RUN={DRY_RUN}")
+    log.info(f"🤖 LiqBot v5 — DRY_RUN={DRY_RUN}")
 
-    # Charge la watchlist persistée depuis JSONBin
-    watchlist = load_watchlist()
+    # Charge immédiatement depuis Dune
+    watchlist = load_from_dune()
 
     send_alert(
-        f"🤖 <b>LiqBot v4 démarré</b>\n"
+        f"🤖 <b>LiqBot v5</b>\n"
         f"Mode     : {'SIMULATION' if DRY_RUN else 'LIVE'}\n"
         f"Watchlist: {len(watchlist)} adresses\n"
-        f"Source   : 100% on-chain Alchemy"
+        f"Niche    : dette 100–5000$"
     )
 
-    last_onchain_refresh = 0
-    consecutive_errors   = 0
-    scan_count           = 0
+    last_dune_refresh = time.time()
+    consecutive_errors = 0
+    scan_count = 0
 
     while True:
         try:
             now_ts = time.time()
             block  = w3.eth.block_number
 
-            # Refresh on-chain toutes les 5 minutes
-            if now_ts - last_onchain_refresh > ONCHAIN_REFRESH:
-                watchlist = fetch_borrowers_onchain(watchlist)
-                last_onchain_refresh = now_ts
+            # Refresh Dune toutes les 5 minutes
+            if now_ts - last_dune_refresh > DUNE_REFRESH:
+                new_addrs  = load_from_dune()
+                # Merge : garde les adresses déjà en watchlist + nouvelles
+                existing   = set(watchlist)
+                watchlist  = list(existing | set(new_addrs))
+                last_dune_refresh = now_ts
+                log.info(f"🔄 Watchlist refreshée: {len(watchlist)} adresses")
 
-            # Scan RPC direct sur toute la watchlist
-            log.info(
-                f"🔍 Bloc #{block} | watchlist={len(watchlist)} adresses"
-            )
+            log.info(f"🔍 Bloc #{block} | {len(watchlist)} adresses")
             watchlist = scan_watchlist(watchlist)
 
-            # Update JSONBin toutes les 10 itérations
             scan_count += 1
             if scan_count % 10 == 0:
                 log_scan(block, len(watchlist))
@@ -269,7 +269,7 @@ def main():
             consecutive_errors += 1
             log.error(f"❌ Erreur #{consecutive_errors}: {e}")
             if consecutive_errors >= 3:
-                send_alert(f"🚨 3 erreurs consécutives\n{e}\nPause 1h")
+                send_alert(f"🚨 3 erreurs\n{e}\nPause 1h")
                 time.sleep(3600)
                 consecutive_errors = 0
             else:
