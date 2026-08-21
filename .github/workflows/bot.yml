@@ -62,3 +62,5 @@ jobs:
           name: liqbot-logs-${{ github.run_number }}
           path: logs/
           retention-days: 7
+
+          

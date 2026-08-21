@@ -78,27 +78,51 @@ log.info(f"✅ Connecté à Arbitrum — bloc #{w3.eth.block_number}")
 
 def load_from_dune() -> list:
     """
-    Charge les emprunteurs actifs depuis Dune.
-    Retourne une liste d'adresses prête à être scannée.
-    Simple, direct, fiable.
+    Execute la query Dune puis récupère les résultats.
+    Zéro dépendance sur le cache — toujours des données fraîches.
     """
     try:
-        r = requests.get(
-            f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/results",
-            headers={"X-Dune-API-Key": DUNE_API_KEY},
+        headers = {"X-Dune-API-Key": DUNE_API_KEY}
+
+        # 1. Lance l'exécution
+        exec_r = requests.post(
+            f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/execute",
+            headers=headers,
+            timeout=30
+        )
+        execution_id = exec_r.json().get("execution_id")
+        if not execution_id:
+            log.warning(f"Dune execute failed: {exec_r.text[:100]}")
+            return []
+
+        log.info(f"⏳ Dune query en cours ({execution_id[:8]}…)")
+
+        # 2. Poll jusqu'à completion (max 60s)
+        for attempt in range(12):
+            time.sleep(5)
+            status_r = requests.get(
+                f"https://api.dune.com/api/v1/execution/{execution_id}/status",
+                headers=headers,
+                timeout=15
+            )
+            state = status_r.json().get("state", "")
+            log.info(f"⏳ Dune status: {state} ({attempt+1}/12)")
+
+            if state == "QUERY_STATE_COMPLETED":
+                break
+            if state in ["QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED"]:
+                log.warning(f"Dune query {state}")
+                return []
+
+        # 3. Récupère les résultats
+        results_r = requests.get(
+            f"https://api.dune.com/api/v1/execution/{execution_id}/results",
+            headers=headers,
             params={"limit": 1000},
             timeout=30
         )
-        if r.status_code != 200:
-            log.warning(f"Dune {r.status_code}: {r.text[:80]}")
-            return []
-
-        rows = r.json().get("result", {}).get("rows", [])
-        addrs = [
-            row["user_address"]
-            for row in rows
-            if row.get("user_address")
-        ]
+        rows = results_r.json().get("result", {}).get("rows", [])
+        addrs = [row["user_address"] for row in rows if row.get("user_address")]
         log.info(f"📡 Dune: {len(addrs)} emprunteurs chargés")
         return addrs
 
