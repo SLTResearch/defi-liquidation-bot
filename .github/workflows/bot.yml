@@ -39,7 +39,6 @@ jobs:
       - name: Run LiqBot
         timeout-minutes: 8
         env:
-          # Injection automatique des GitHub Secrets
           ALCHEMY_RPC_URL:   ${{ secrets.ALCHEMY_RPC_URL }}
           PRIVATE_KEY:       ${{ secrets.PRIVATE_KEY }}
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
@@ -49,11 +48,10 @@ jobs:
           JSONBIN_BIN_ID:    ${{ secrets.JSONBIN_BIN_ID }}
           JSONBIN_API_KEY:   ${{ secrets.JSONBIN_API_KEY }}
           MIN_PROFIT_EUR:    "0.50"
+          PYTHONUNBUFFERED:  "1"
         run: |
-          python3 monitor.py &
+          python3 -u monitor.py 2>&1 | tee logs/monitor.log &
           BOT_PID=$!
-
-          # Laisse tourner 7 minutes puis arrête proprement
           sleep 420
           kill $BOT_PID 2>/dev/null || true
 
